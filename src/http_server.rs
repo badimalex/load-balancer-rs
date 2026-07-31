@@ -14,7 +14,9 @@ use hyper_util::rt::TokioIo;
 use simpleload_balancer_rs::LoadBalancer;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::time::timeout;
 
 type HttpClient = Client<HttpConnector, Full<Bytes>>;
 
@@ -76,27 +78,26 @@ async fn handle_request(
             };
 
             let full_body = Full::new(collected);
-            let new_req = Request::from_parts(parts, full_body);
 
-            let backend_response = match client.request(new_req).await {
-                Ok(response) => response,
-                Err(_) => {
-                    return Ok(text_response(StatusCode::BAD_GATEWAY, "bad gateway"));
-                }
-            };
+            let upstream_result = timeout(Duration::from_secs(2), async {
+                let new_req = Request::from_parts(parts, full_body);
+                let res = client.request(new_req).await?;
+                let (parts, body) = res.into_parts();
+                let bytes = body.collect().await?.to_bytes();
+                Ok::<_, Box<dyn std::error::Error>>(Response::from_parts(parts, bytes.into()))
+            })
+            .await;
 
-            let (response_parts, response_body) = backend_response.into_parts();
-
-            let response_bytes = match response_body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(_) => {
-                    return Ok(text_response(StatusCode::BAD_GATEWAY, "bad gateway"));
-                }
-            };
-            Ok(Response::from_parts(
-                response_parts,
-                Full::new(response_bytes),
-            ))
+            match upstream_result {
+                Ok(Ok(response)) => Ok(response),
+                /* обработка ошибки запроса */
+                Ok(Err(_)) => Ok(text_response(StatusCode::BAD_GATEWAY, "bad gateway")),
+                /* обработка истечения времени (Elapsed) */
+                Err(_) => Ok(text_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "gateway timeout",
+                )),
+            }
         }
     }
 }
@@ -110,10 +111,10 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>
 
 pub async fn run(
     address: &str,
-    load_balancer_obj: LoadBalancer,
+    load_balancer: LoadBalancer,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(address).await?;
-    let shared_load_balancer = Arc::new(Mutex::new(load_balancer_obj));
+    let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
 
     loop {
