@@ -1,4 +1,6 @@
+pub mod http_server;
 pub mod backend;
+
 mod backend_pool;
 mod load_balancer;
 mod routing;

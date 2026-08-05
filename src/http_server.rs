@@ -11,12 +11,13 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
-use simpleload_balancer_rs::LoadBalancer;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
+
+use crate::LoadBalancer;
 
 type HttpClient = Client<HttpConnector, Full<Bytes>>;
 
@@ -109,13 +110,12 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>
         .unwrap()
 }
 
-pub async fn run(
-    address: &str,
+pub async fn serve(
+    listener: TcpListener,
     load_balancer: LoadBalancer,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind(address).await?;
-    let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
 
     loop {
         let client_for_connection = client.clone();
@@ -143,4 +143,13 @@ pub async fn run(
             }
         }
     }
+}
+
+pub async fn run(
+    address: &str,
+    load_balancer: LoadBalancer,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = TcpListener::bind(address).await?;
+
+    serve(listener, load_balancer).await
 }
