@@ -1,5 +1,5 @@
-pub mod http_server;
 pub mod backend;
+pub mod http_server;
 
 mod backend_pool;
 mod load_balancer;

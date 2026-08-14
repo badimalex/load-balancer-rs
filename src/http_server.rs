@@ -80,11 +80,12 @@ async fn handle_request(
 
             let full_body = Full::new(collected);
 
-            let upstream_result = timeout(Duration::from_secs(2), async {
+            let upstream_result = timeout(Duration::from_secs(1), async {
                 let new_req = Request::from_parts(parts, full_body);
                 let res = client.request(new_req).await?;
                 let (parts, body) = res.into_parts();
                 let bytes = body.collect().await?.to_bytes();
+
                 Ok::<_, Box<dyn std::error::Error>>(Response::from_parts(parts, bytes.into()))
             })
             .await;
