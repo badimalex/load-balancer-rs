@@ -26,4 +26,8 @@ impl BackendPool {
     pub fn get(&self, index: usize) -> Option<&Backend> {
         self.items.get(index)
     }
+
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Backend> {
+        self.items.get_mut(index)
+    }
 }

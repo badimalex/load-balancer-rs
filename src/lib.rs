@@ -3,12 +3,10 @@ pub mod http_server;
 
 mod backend_pool;
 mod load_balancer;
-mod routing;
 
 pub use backend::Backend;
 pub use backend_pool::BackendPool;
 pub use load_balancer::LoadBalancer;
-pub use routing::round_robin::RoundRobin;
 
 #[cfg(test)]
 mod tests {
@@ -79,23 +77,23 @@ mod tests {
     // RoundRobin
 
     #[test]
-    fn selection_wraps_after_last_backend() {
+    fn round_robin_cycles_through_backends() {
         let mut pool = BackendPool::new();
         pool.add(Backend::new("server-a:8080".to_string()));
         pool.add(Backend::new("server-b:8080".to_string()));
         pool.add(Backend::new("server-c:8080".to_string()));
         pool.add(Backend::new("server-d:8080".to_string()));
 
-        let mut selector = RoundRobin::new();
+        let mut load_balancer = LoadBalancer::new(pool);
 
-        assert_eq!(selector.select_next(&pool), Some(0));
-        assert_eq!(selector.select_next(&pool), Some(1));
-        assert_eq!(selector.select_next(&pool), Some(2));
-        assert_eq!(selector.select_next(&pool), Some(3));
-        assert_eq!(selector.select_next(&pool), Some(0));
-        assert_eq!(selector.select_next(&pool), Some(1));
-        assert_eq!(selector.select_next(&pool), Some(2));
-        assert_eq!(selector.select_next(&pool), Some(3));
+        assert_eq!(load_balancer.route(), Some((0, "server-a:8080")));
+        assert_eq!(load_balancer.route(), Some((1, "server-b:8080")));
+        assert_eq!(load_balancer.route(), Some((2, "server-c:8080")));
+        assert_eq!(load_balancer.route(), Some((3, "server-d:8080")));
+        assert_eq!(load_balancer.route(), Some((0, "server-a:8080")));
+        assert_eq!(load_balancer.route(), Some((1, "server-b:8080")));
+        assert_eq!(load_balancer.route(), Some((2, "server-c:8080")));
+        assert_eq!(load_balancer.route(), Some((3, "server-d:8080")));
     }
 
     #[test]
@@ -103,157 +101,23 @@ mod tests {
         let mut pool = BackendPool::new();
         pool.add(Backend::new("server-a:8080".to_string()));
 
-        let mut selector = RoundRobin::new();
+        let mut lb = LoadBalancer::new(pool);
 
         for _ in 0..5 {
-            assert_eq!(selector.select_next(&pool), Some(0));
+            assert_eq!(lb.route(), Some((0, "server-a:8080")));
         }
-    }
-
-    #[test]
-    fn round_robin_instances_have_independent_state() {
-        let mut pool = BackendPool::new();
-        pool.add(Backend::new("server-a:8080".to_string()));
-        pool.add(Backend::new("server-b:8080".to_string()));
-        pool.add(Backend::new("server-c:8080".to_string()));
-
-        let mut first_selector = RoundRobin::new();
-        let mut second_selector = RoundRobin::new();
-
-        assert_eq!(first_selector.select_next(&pool), Some(0));
-        assert_eq!(first_selector.select_next(&pool), Some(1));
-
-        assert_eq!(second_selector.select_next(&pool), Some(0));
-        assert_eq!(first_selector.select_next(&pool), Some(2));
-        assert_eq!(second_selector.select_next(&pool), Some(1));
     }
 
     #[test]
     fn empty_pool_returns_none() {
         let pool = BackendPool::new();
-        let mut selector = RoundRobin::new();
+        let mut selector = LoadBalancer::new(pool);
 
-        assert_eq!(selector.select_next(&pool), None);
+        assert_eq!(selector.route(), None);
     }
 
     #[test]
-    fn first_selection_returns_zero() {
-        let mut pool = BackendPool::new();
-        pool.add(Backend::new("server-a:8080".to_string()));
-
-        let mut selector = RoundRobin::new();
-
-        assert_eq!(selector.select_next(&pool), Some(0));
-    }
-
-    #[test]
-    fn successive_selections_follow_pool_order() {
-        let mut pool = BackendPool::new();
-        pool.add(Backend::new("server-a:8080".to_string()));
-        pool.add(Backend::new("server-b:8080".to_string()));
-        pool.add(Backend::new("server-c:8080".to_string()));
-
-        let mut selector = RoundRobin::new();
-
-        assert_eq!(selector.select_next(&pool), Some(0));
-        assert_eq!(selector.select_next(&pool), Some(1));
-        assert_eq!(selector.select_next(&pool), Some(2));
-    }
-
-    #[test]
-    fn round_robin_selection_resolves_to_backend_addresses() {
-        let mut pool = BackendPool::new();
-        pool.add(Backend::new("server-a:8080".to_string()));
-        pool.add(Backend::new("server-b:8080".to_string()));
-        pool.add(Backend::new("server-c:8080".to_string()));
-
-        let mut selector = RoundRobin::new();
-
-        let expected_addresses = [
-            "server-a:8080",
-            "server-b:8080",
-            "server-c:8080",
-            "server-a:8080",
-        ];
-
-        for expected_address in expected_addresses {
-            let index = selector
-                .select_next(&pool)
-                .expect("non-empty pool should produce an index");
-
-            let backend = pool
-                .get(index)
-                .expect("selector should produce a valid pool index");
-
-            assert_eq!(backend.address(), expected_address);
-        }
-    }
-
-    #[test]
-    fn empty_pool_does_not_advance_selector_state() {
-        let mut pool = BackendPool::new();
-        pool.add(Backend::new("server-a:8080".to_string()));
-        pool.add(Backend::new("server-b:8080".to_string()));
-
-        let empty_pool = BackendPool::new();
-        let mut selector = RoundRobin::new();
-
-        assert_eq!(selector.select_next(&pool), Some(0));
-        assert_eq!(selector.select_next(&empty_pool), None);
-        assert_eq!(selector.select_next(&pool), Some(1));
-    }
-
-    // LoadBalancer
-    #[test]
-    fn test_empty_load_balancer() {
-        let pool = BackendPool::new();
-        let mut load_balancer = LoadBalancer::new(pool);
-        assert_eq!(load_balancer.route(), None);
-        assert_eq!(load_balancer.route(), None);
-    }
-
-    #[test]
-    fn test_single_backend() {
-        let mut pool = BackendPool::new();
-        pool.add(Backend::new("server-a:8080".to_string()));
-        let mut load_balancer = LoadBalancer::new(pool);
-
-        for _ in 0..5 {
-            assert_eq!(load_balancer.route(), Some("server-a:8080"));
-        }
-    }
-
-    #[test]
-    fn test_round_robin_routing() {
-        let mut pool = BackendPool::new();
-        pool.add(Backend::new("server-a:8080".to_string()));
-        pool.add(Backend::new("server-b:8080".to_string()));
-        let mut load_balancer = LoadBalancer::new(pool);
-
-        assert_eq!(load_balancer.route(), Some("server-a:8080"));
-        assert_eq!(load_balancer.route(), Some("server-b:8080"));
-        assert_eq!(load_balancer.route(), Some("server-a:8080"));
-    }
-
-    #[test]
-    fn test_three_backends_seven_calls() {
-        let mut pool = BackendPool::new();
-        pool.add(Backend::new("server-a".to_string()));
-        pool.add(Backend::new("server-b".to_string()));
-        pool.add(Backend::new("server-c".to_string()));
-        let mut lb = LoadBalancer::new(pool);
-
-        assert_eq!(lb.route(), Some("server-a"));
-        assert_eq!(lb.route(), Some("server-b"));
-        assert_eq!(lb.route(), Some("server-c"));
-        assert_eq!(lb.route(), Some("server-a"));
-        assert_eq!(lb.route(), Some("server-b"));
-        assert_eq!(lb.route(), Some("server-c"));
-        assert_eq!(lb.route(), Some("server-a"));
-    }
-
-    #[test]
-    fn test_instances_independence() {
+    fn load_balancer_instances_have_independent_routing_state() {
         let mut pool1 = BackendPool::new();
         pool1.add(Backend::new("a".to_string()));
         pool1.add(Backend::new("b".to_string()));
@@ -266,13 +130,135 @@ mod tests {
         pool2.add(Backend::new("c".to_string()));
         let mut lb2 = LoadBalancer::new(pool2);
 
-        assert_eq!(lb1.route(), Some("a"));
-        assert_eq!(lb1.route(), Some("b"));
+        assert_eq!(lb1.route(), Some((0, "a")));
+        assert_eq!(lb1.route(), Some((1, "b")));
 
-        assert_eq!(lb2.route(), Some("a"));
+        assert_eq!(lb2.route(), Some((0, "a")));
 
-        assert_eq!(lb1.route(), Some("c"));
-        assert_eq!(lb2.route(), Some("b"));
-        assert_eq!(lb2.route(), Some("c"));
+        assert_eq!(lb1.route(), Some((2, "c")));
+        assert_eq!(lb2.route(), Some((1, "b")));
+        assert_eq!(lb2.route(), Some((2, "c")));
+    }
+
+    #[test]
+    fn new_backend_is_healthy() {
+        let b = Backend::new("127.0.0.1:8080".to_string());
+        assert!(b.is_healthy());
+    }
+
+    #[test]
+    fn backend_can_be_marked_unhealthy() {
+        let mut b = Backend::new("127.0.0.1:8080".to_string());
+        b.set_healthy(false);
+        assert!(!b.is_healthy());
+    }
+
+    #[test]
+    fn backend_can_become_healthy_again() {
+        let mut b = Backend::new("127.0.0.1:8080".to_string());
+        b.set_healthy(false);
+        b.set_healthy(true);
+        assert!(b.is_healthy());
+    }
+
+    #[test]
+    fn routing_skips_several_unhealthy_backends() {
+        let mut pool = BackendPool::new();
+        pool.add(Backend::new("server1".to_string()));
+        pool.add(Backend::new("server2".to_string()));
+        pool.add(Backend::new("server3".to_string()));
+        pool.add(Backend::new("server4".to_string()));
+
+        let mut lb = LoadBalancer::new(pool);
+        lb.set_backend_healthy(1, false);
+        lb.set_backend_healthy(2, false);
+
+        assert_eq!(lb.route(), Some((0, "server1")));
+        assert_eq!(lb.route(), Some((3, "server4"))); // пропуск 2 и 3
+        assert_eq!(lb.route(), Some((0, "server1")));
+    }
+
+    #[test]
+    fn all_backends_unhealthy_returns_none() {
+        let mut pool = BackendPool::new();
+        pool.add(Backend::new("server1".to_string()));
+        pool.add(Backend::new("server2".to_string()));
+
+        let mut lb = LoadBalancer::new(pool);
+        lb.set_backend_healthy(0, false);
+        lb.set_backend_healthy(1, false);
+        assert_eq!(lb.route(), None);
+    }
+
+    #[test]
+    fn one_healthy_backend_is_selected_repeatedly() {
+        let mut pool = BackendPool::new();
+        pool.add(Backend::new("server1".to_string()));
+        pool.add(Backend::new("server2".to_string()));
+        pool.add(Backend::new("server3".to_string()));
+
+        let mut lb = LoadBalancer::new(pool);
+        lb.set_backend_healthy(0, false);
+        lb.set_backend_healthy(2, false);
+
+        assert_eq!(lb.route(), Some((1, "server2")));
+        assert_eq!(lb.route(), Some((1, "server2")));
+        assert_eq!(lb.route(), Some((1, "server2")));
+    }
+
+    #[test]
+    fn recovered_backend_returns_to_rotation() {
+        let mut pool = BackendPool::new();
+        pool.add(Backend::new("server1".to_string()));
+        pool.add(Backend::new("server2".to_string()));
+
+        let mut lb = LoadBalancer::new(pool);
+        lb.set_backend_healthy(1, false);
+
+        assert_eq!(lb.route(), Some((0, "server1")));
+        assert_eq!(lb.route(), Some((0, "server1")));
+
+        // Восстанавливаем server2
+        lb.set_backend_healthy(1, true);
+
+        assert_eq!(lb.route(), Some((1, "server2")));
+        assert_eq!(lb.route(), Some((0, "server1")));
+    }
+
+    #[test]
+    fn backend_marked_unhealthy_through_load_balancer_is_skipped() {
+        let mut pool = BackendPool::new();
+        pool.add(Backend::new("server_A".to_string()));
+        pool.add(Backend::new("server_B".to_string()));
+        pool.add(Backend::new("server_C".to_string()));
+
+        let mut lb = LoadBalancer::new(pool);
+
+        lb.set_backend_healthy(1, false);
+
+        assert_eq!(lb.route(), Some((0, "server_A")));
+        assert_eq!(lb.route(), Some((2, "server_C")));
+        assert_eq!(lb.route(), Some((0, "server_A")));
+        assert_eq!(lb.route(), Some((2, "server_C")));
+    }
+
+    #[test]
+    fn test_unhealthy_backends_snapshot() {
+        let mut pool = BackendPool::new();
+        pool.add(Backend::new("server_A".to_string()));
+        pool.add(Backend::new("server_B".to_string()));
+        pool.add(Backend::new("server_C".to_string()));
+
+        let mut lb = LoadBalancer::new(pool);
+
+        let snapshot = lb.unhealthy_backends_snapshot();
+        assert_eq!(snapshot.len(), 0);
+
+        lb.set_backend_healthy(1, false);
+        let snapshot2 = lb.unhealthy_backends_snapshot();
+        assert_eq!(snapshot2.len(), 1);
+
+        assert_eq!(snapshot2[0].index, 1);
+        assert_eq!(snapshot2[0].address, "server_B");
     }
 }

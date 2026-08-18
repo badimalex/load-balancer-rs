@@ -3,11 +3,16 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use simpleload_balancer_rs::{Backend, BackendPool, LoadBalancer, http_server::serve};
+use simpleload_balancer_rs::{
+    Backend, BackendPool, LoadBalancer, http_server::serve, http_server::start_health_checker,
+};
 use tokio::{net::TcpListener, sync::oneshot::Sender};
 type HttpClient = Client<HttpConnector, Full<Bytes>>;
 use hyper_util::rt::TokioExecutor;
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use std::time::Duration;
@@ -18,9 +23,18 @@ async fn spawn_proxy(
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    // let handle = tokio::spawn(serve(listener, load_balancer));
+    let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
+
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+
+    start_health_checker(
+        Arc::clone(&shared_load_balancer),
+        client.clone(),
+        Duration::from_millis(100),
+    );
+
     let handle = tokio::spawn(async move {
-        serve(listener, load_balancer).await.unwrap();
+        serve(listener, shared_load_balancer, client).await.unwrap();
     });
 
     (addr, handle)
@@ -32,7 +46,10 @@ async fn test_empty_pool_returns_503() {
     let addr = listener.local_addr().unwrap();
     let pool = BackendPool::new();
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
-    let server_handle = tokio::spawn(serve(listener, LoadBalancer::new(pool)));
+
+    let shared_load_balancer = Arc::new(Mutex::new(LoadBalancer::new(pool)));
+
+    let server_handle = tokio::spawn(serve(listener, shared_load_balancer, client.clone()));
     let req = Request::builder()
         .uri(format!("http://{}/any", addr))
         .body(Full::new(Bytes::new()))
@@ -65,6 +82,25 @@ async fn spawn_backend(body: &'static str) -> SocketAddr {
     address
 }
 
+async fn spawn_backend_on_addr(body: &'static str, addr: SocketAddr) -> SocketAddr {
+    let listener = TcpListener::bind(addr).await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    address
+}
+
 #[tokio::test]
 async fn test_health_does_not_advance_round_robin() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -78,8 +114,10 @@ async fn test_health_does_not_advance_round_robin() {
     pool.add(Backend::new(format!("http://{backend_b}")));
 
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
-    let load_balancer = LoadBalancer::new(pool);
-    let server_handle = tokio::spawn(serve(listener, load_balancer));
+
+    let shared_load_balancer = Arc::new(Mutex::new(LoadBalancer::new(pool)));
+
+    let server_handle = tokio::spawn(serve(listener, shared_load_balancer, client.clone()));
 
     // Запрос /health не должен сдвигать балансировку
     let req_health = Request::builder()
@@ -105,6 +143,524 @@ async fn test_health_does_not_advance_round_robin() {
     assert_eq!(&body[..], b"backend-a");
 
     server_handle.abort();
+}
+
+#[tokio::test]
+async fn http_routing_skips_unhealthy_backend() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mut pool = BackendPool::new();
+    let backend_a = spawn_backend("backend-a").await;
+    let backend_b = spawn_backend("backend-b").await;
+    let backend_c = spawn_backend("backend-c").await;
+
+    pool.add(Backend::new(format!("http://{backend_a}")));
+    pool.add(Backend::new(format!("http://{backend_b}")));
+    pool.add(Backend::new(format!("http://{backend_c}")));
+
+    let mut load_balancer = LoadBalancer::new(pool);
+    load_balancer.set_backend_healthy(1, false);
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+
+    let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
+
+    let server_handle = tokio::spawn(serve(listener, shared_load_balancer, client.clone()));
+
+    let req1 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res1 = client.request(req1).await.unwrap();
+
+    assert_eq!(res1.status(), StatusCode::OK);
+    let body = res1.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    let req2 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res2 = client.request(req2).await.unwrap();
+
+    assert_eq!(res2.status(), StatusCode::OK);
+    let body = res2.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-c");
+
+    let req3 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res3 = client.request(req3).await.unwrap();
+
+    assert_eq!(res3.status(), StatusCode::OK);
+    let body = res3.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    let req4 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res4 = client.request(req4).await.unwrap();
+
+    assert_eq!(res4.status(), StatusCode::OK);
+    let body = res4.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-c");
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn upstream_failure_marks_backend_unhealthy() {
+    let mut pool = BackendPool::new();
+    let backend_a = spawn_backend("backend-a").await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let backend_b = Backend::new(format!("http://{unavailable_addr}"));
+
+    pool.add(Backend::new(format!("http://{backend_a}")));
+    pool.add(backend_b);
+
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+
+    let (addr, handle) = spawn_proxy(LoadBalancer::new(pool)).await;
+
+    // req 1
+
+    let req1 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res1 = client.request(req1).await.unwrap();
+
+    assert_eq!(res1.status(), StatusCode::OK);
+    let body = res1.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    // req 2
+
+    let req1 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res1 = client.request(req1).await.unwrap();
+
+    assert_eq!(res1.status(), StatusCode::BAD_GATEWAY);
+    let body = res1.collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"bad gateway");
+
+    // req 3
+
+    let req3 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res3 = client.request(req3).await.unwrap();
+
+    assert_eq!(res3.status(), StatusCode::OK);
+    let body = res3.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    // req 4
+
+    let req4 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res4 = client.request(req4).await.unwrap();
+
+    assert_eq!(res4.status(), StatusCode::OK);
+    let body = res4.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn recovered_backend_returns_to_http_routing() {
+    let mut pool = BackendPool::new();
+    let backend_a = spawn_backend("backend-a").await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let backend_b = Backend::new(format!("http://{unavailable_addr}"));
+
+    pool.add(Backend::new(format!("http://{backend_a}")));
+    pool.add(backend_b);
+
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+
+    let (addr, handle) = spawn_proxy(LoadBalancer::new(pool)).await;
+
+    // req 1
+
+    let req1 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res1 = client.request(req1).await.unwrap();
+
+    assert_eq!(res1.status(), StatusCode::OK);
+    let body = res1.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    // req 2
+
+    let req1 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res1 = client.request(req1).await.unwrap();
+
+    assert_eq!(res1.status(), StatusCode::BAD_GATEWAY);
+    let body = res1.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"bad gateway");
+
+    // req 3
+
+    let req3 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res3 = client.request(req3).await.unwrap();
+
+    assert_eq!(res3.status(), StatusCode::OK);
+    let body = res3.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    let _ = spawn_backend_on_addr("backend-b", unavailable_addr).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // req 4
+
+    let req4 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res4 = client.request(req4).await.unwrap();
+
+    assert_eq!(res4.status(), StatusCode::OK);
+    let body = res4.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-b");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn backend_remains_unhealthy_if_not_recovered() {
+    let mut pool = BackendPool::new();
+    let backend_a = spawn_backend("backend-a").await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let backend_b = Backend::new(format!("http://{unavailable_addr}"));
+
+    pool.add(Backend::new(format!("http://{backend_a}")));
+    pool.add(backend_b);
+
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+
+    let (addr, handle) = spawn_proxy(LoadBalancer::new(pool)).await;
+
+    // req 1
+
+    let req1 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res1 = client.request(req1).await.unwrap();
+
+    assert_eq!(res1.status(), StatusCode::OK);
+    let body = res1.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    // req 2
+
+    let req1 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res1 = client.request(req1).await.unwrap();
+
+    assert_eq!(res1.status(), StatusCode::BAD_GATEWAY);
+    let body = res1.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"bad gateway");
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    // req 3
+
+    let req3 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res3 = client.request(req3).await.unwrap();
+
+    assert_eq!(res3.status(), StatusCode::OK);
+    let body = res3.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    // req 4
+
+    let req4 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res4 = client.request(req4).await.unwrap();
+
+    assert_eq!(res4.status(), StatusCode::OK);
+    let body = res4.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn multiple_unhealthy_backends_recover_independently() {
+    let mut pool = BackendPool::new();
+    let backend_a = spawn_backend("backend-a").await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_addr_c = listener_c.local_addr().unwrap();
+    drop(listener_c);
+
+    let backend_b = Backend::new(format!("http://{unavailable_addr}"));
+    let backend_c = Backend::new(format!("http://{unavailable_addr_c}"));
+
+    pool.add(Backend::new(format!("http://{backend_a}")));
+    pool.add(backend_b);
+    pool.add(backend_c);
+
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+
+    let (addr, handle) = spawn_proxy(LoadBalancer::new(pool)).await;
+
+    // req 1
+
+    let req1 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res1 = client.request(req1).await.unwrap();
+
+    assert_eq!(res1.status(), StatusCode::OK);
+    let body = res1.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    // req 2
+
+    let req2 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res2 = client.request(req2).await.unwrap();
+
+    assert_eq!(res2.status(), StatusCode::BAD_GATEWAY);
+    let body = res2.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"bad gateway");
+
+    // req 3
+
+    let req3 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res3 = client.request(req3).await.unwrap();
+
+    assert_eq!(res3.status(), StatusCode::BAD_GATEWAY);
+    let body = res3.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"bad gateway");
+
+    // req 4
+
+    let req4 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res4 = client.request(req4).await.unwrap();
+
+    assert_eq!(res4.status(), StatusCode::OK);
+    let body = res4.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    // res 5
+
+    let req5 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res5 = client.request(req5).await.unwrap();
+
+    assert_eq!(res5.status(), StatusCode::OK);
+    let body = res5.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    let _ = spawn_backend_on_addr("backend-b", unavailable_addr).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // req 6
+
+    let req6 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res6 = client.request(req6).await.unwrap();
+
+    assert_eq!(res6.status(), StatusCode::OK);
+    let body = res6.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-b");
+
+    // req 7
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res = client.request(req).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-a");
+
+    // req 8
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res = client.request(req).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-b");
+
+    let _ = spawn_backend_on_addr("backend-c", unavailable_addr_c).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // req 9
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res = client.request(req).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.collect().await.unwrap().to_bytes();
+
+    assert_eq!(&body[..], b"backend-c");
+
+    handle.abort();
 }
 
 #[tokio::test]

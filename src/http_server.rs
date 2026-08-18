@@ -15,6 +15,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::time::sleep;
 use tokio::time::timeout;
 
 use crate::LoadBalancer;
@@ -33,7 +34,7 @@ async fn handle_request(
         (&Method::GET, "/health") => Ok(text_response(StatusCode::OK, "ok")),
 
         _ => {
-            let backend_address: String = {
+            let (backend_address, backend_index) = {
                 let Ok(mut guard) = load_balancer_obj.lock() else {
                     return Ok(text_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -41,15 +42,16 @@ async fn handle_request(
                     ));
                 };
 
-                let Some(next_url) = guard.route() else {
+                let Some((index, address)) = guard.route() else {
                     return Ok(text_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "no backends available",
                     ));
                 };
 
-                next_url.to_owned()
+                (address.to_owned(), index)
             };
+
             let path_and_query = request
                 .uri()
                 .path_and_query()
@@ -93,7 +95,12 @@ async fn handle_request(
             match upstream_result {
                 Ok(Ok(response)) => Ok(response),
                 /* обработка ошибки запроса */
-                Ok(Err(_)) => Ok(text_response(StatusCode::BAD_GATEWAY, "bad gateway")),
+                Ok(Err(_)) => {
+                    if let Ok(mut guard) = load_balancer_obj.lock() {
+                        guard.set_backend_healthy(backend_index, false);
+                    }
+                    Ok(text_response(StatusCode::BAD_GATEWAY, "bad gateway"))
+                }
                 /* обработка истечения времени (Elapsed) */
                 Err(_) => Ok(text_response(
                     StatusCode::GATEWAY_TIMEOUT,
@@ -111,20 +118,31 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>
         .unwrap()
 }
 
+async fn check_backend_health(client: HttpClient, backend_address: String) -> bool {
+    let req = Request::builder()
+        .method("GET")
+        .uri(backend_address)
+        .body(Full::new(Bytes::from("")))
+        .unwrap();
+
+    match tokio::time::timeout(Duration::from_secs(2), client.request(req)).await {
+        Ok(Ok(res)) => res.status() == StatusCode::OK,
+        _ => false,
+    }
+}
+
 pub async fn serve(
     listener: TcpListener,
-    load_balancer: LoadBalancer,
+    load_balancer: Arc<Mutex<LoadBalancer>>,
+    client: HttpClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
-    let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
-
     loop {
         let client_for_connection = client.clone();
 
         match listener.accept().await {
             Ok((stream, _)) => {
                 let io = TokioIo::new(stream);
-                let load_balancer_clone = Arc::clone(&shared_load_balancer);
+                let load_balancer_clone = Arc::clone(&load_balancer);
 
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
@@ -152,5 +170,46 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(address).await?;
 
-    serve(listener, load_balancer).await
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
+
+    start_health_checker(
+        Arc::clone(&shared_load_balancer),
+        client.clone(),
+        Duration::from_secs(5),
+    );
+
+    serve(listener, shared_load_balancer, client).await
+}
+
+pub fn start_health_checker(
+    load_balancer: Arc<std::sync::Mutex<LoadBalancer>>,
+    client: HttpClient,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            sleep(interval).await;
+
+            let backends_snapshot = {
+                match load_balancer.lock() {
+                    Ok(guard) => guard.unhealthy_backends_snapshot(),
+                    Err(_) => continue,
+                }
+            };
+
+            for backend in backends_snapshot {
+                let client_clone = client.clone();
+                let lb_clone = Arc::clone(&load_balancer);
+
+                tokio::spawn(async move {
+                    let is_healthy = check_backend_health(client_clone, backend.address).await;
+
+                    if let Ok(mut guard) = lb_clone.lock() {
+                        guard.set_backend_healthy(backend.index, is_healthy);
+                    }
+                });
+            }
+        }
+    });
 }
