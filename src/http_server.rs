@@ -26,6 +26,7 @@ async fn handle_request(
     request: Request<Incoming>,
     load_balancer_obj: Arc<Mutex<LoadBalancer>>,
     client: HttpClient,
+    upstream_timeout_ms: u64,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let method = request.method();
     let path = request.uri().path();
@@ -82,7 +83,7 @@ async fn handle_request(
 
             let full_body = Full::new(collected);
 
-            let upstream_result = timeout(Duration::from_secs(1), async {
+            let upstream_result = timeout(Duration::from_millis(upstream_timeout_ms), async {
                 let new_req = Request::from_parts(parts, full_body);
                 let res = client.request(new_req).await?;
                 let (parts, body) = res.into_parts();
@@ -135,6 +136,7 @@ pub async fn serve(
     listener: TcpListener,
     load_balancer: Arc<Mutex<LoadBalancer>>,
     client: HttpClient,
+    upstream_timeout_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let client_for_connection = client.clone();
@@ -149,7 +151,10 @@ pub async fn serve(
                         let data_clone = Arc::clone(&load_balancer_clone);
                         let client_for_request = client_for_connection.clone();
 
-                        async move { handle_request(req, data_clone, client_for_request).await }
+                        async move {
+                            handle_request(req, data_clone, client_for_request, upstream_timeout_ms)
+                                .await
+                        }
                     });
 
                     if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
@@ -167,6 +172,8 @@ pub async fn serve(
 pub async fn run(
     address: &str,
     load_balancer: LoadBalancer,
+    upstream_timeout_ms: u64,
+    health_check_interval_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(address).await?;
 
@@ -176,10 +183,10 @@ pub async fn run(
     start_health_checker(
         Arc::clone(&shared_load_balancer),
         client.clone(),
-        Duration::from_secs(5),
+        Duration::from_millis(health_check_interval_ms),
     );
 
-    serve(listener, shared_load_balancer, client).await
+    serve(listener, shared_load_balancer, client, upstream_timeout_ms).await
 }
 
 pub fn start_health_checker(

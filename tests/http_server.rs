@@ -18,6 +18,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::time::Duration;
 use tokio::time::sleep;
 
+const UPSTREAM_TIMEOUT_RAW: u64 = 1000;
+
 async fn spawn_proxy(
     load_balancer: LoadBalancer,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -34,7 +36,9 @@ async fn spawn_proxy(
     );
 
     let handle = tokio::spawn(async move {
-        serve(listener, shared_load_balancer, client).await.unwrap();
+        serve(listener, shared_load_balancer, client, UPSTREAM_TIMEOUT_RAW)
+            .await
+            .unwrap();
     });
 
     (addr, handle)
@@ -49,7 +53,12 @@ async fn test_empty_pool_returns_503() {
 
     let shared_load_balancer = Arc::new(Mutex::new(LoadBalancer::new(pool)));
 
-    let server_handle = tokio::spawn(serve(listener, shared_load_balancer, client.clone()));
+    let server_handle = tokio::spawn(serve(
+        listener,
+        shared_load_balancer,
+        client.clone(),
+        UPSTREAM_TIMEOUT_RAW,
+    ));
     let req = Request::builder()
         .uri(format!("http://{}/any", addr))
         .body(Full::new(Bytes::new()))
@@ -117,7 +126,12 @@ async fn test_health_does_not_advance_round_robin() {
 
     let shared_load_balancer = Arc::new(Mutex::new(LoadBalancer::new(pool)));
 
-    let server_handle = tokio::spawn(serve(listener, shared_load_balancer, client.clone()));
+    let server_handle = tokio::spawn(serve(
+        listener,
+        shared_load_balancer,
+        client.clone(),
+        UPSTREAM_TIMEOUT_RAW,
+    ));
 
     // Запрос /health не должен сдвигать балансировку
     let req_health = Request::builder()
@@ -165,7 +179,12 @@ async fn http_routing_skips_unhealthy_backend() {
 
     let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
 
-    let server_handle = tokio::spawn(serve(listener, shared_load_balancer, client.clone()));
+    let server_handle = tokio::spawn(serve(
+        listener,
+        shared_load_balancer,
+        client.clone(),
+        UPSTREAM_TIMEOUT_RAW,
+    ));
 
     let req1 = Request::builder()
         .method("GET")
