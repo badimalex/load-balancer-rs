@@ -1,3 +1,6 @@
+use crate::AppError;
+use crate::LoadBalancer;
+
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::Full;
@@ -15,12 +18,82 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
-use crate::LoadBalancer;
+use tracing::{error, info, warn};
 
 type HttpClient = Client<HttpConnector, Full<Bytes>>;
+
+pub async fn run(
+    address: &str,
+    load_balancer: LoadBalancer,
+    upstream_timeout_ms: u64,
+    health_check_interval_ms: u64,
+    cancellation: CancellationToken,
+) -> Result<(), AppError> {
+    let listener = TcpListener::bind(address).await.map_err(AppError::Bind)?;
+
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
+
+    // Сигнал ОС на завершение (Ctrl+C)
+    let signal_token = cancellation.clone();
+    let signal_handle = tokio::spawn(async move {
+        tokio::select! {
+              sig = tokio::signal::ctrl_c() => {
+                    match sig {
+                         Ok(_) => {
+                            info!("Shutdown started");
+                            signal_token.cancel();
+                            Ok(())
+                        }
+                        Err(e) => {
+                            signal_token.cancel();
+                            Err(AppError::Shutdown(e))
+                        }
+                    }
+                }
+            _ = signal_token.cancelled() => {
+                // приложение завершилось по другой причине
+                Ok(())
+            }
+        }
+    });
+
+    let mut serve_handle = tokio::spawn(serve(
+        listener,
+        Arc::clone(&shared_load_balancer),
+        client.clone(),
+        upstream_timeout_ms,
+        cancellation.clone(),
+    ));
+
+    let mut health_handle = tokio::spawn(start_health_checker(
+        shared_load_balancer,
+        client,
+        Duration::from_millis(health_check_interval_ms),
+        cancellation.clone(),
+    ));
+
+    let (winner, loser) = tokio::select! {
+        res = &mut serve_handle => (res, health_handle),
+        res = &mut health_handle => (res, serve_handle),
+    };
+
+    cancellation.cancel();
+
+    let loser_result = loser.await;
+    signal_handle.await.map_err(AppError::Task)??;
+
+    winner.map_err(AppError::Task)??;
+    loser_result.map_err(AppError::Task)??;
+
+    info!("Shutdown completed");
+    Ok(())
+}
 
 async fn handle_request(
     request: Request<Incoming>,
@@ -99,6 +172,7 @@ async fn handle_request(
                 Ok(Err(_)) => {
                     if let Ok(mut guard) = load_balancer_obj.lock() {
                         guard.set_backend_healthy(backend_index, false);
+                        warn!(backend_url = %backend_address, "Backend marked unhealthy");
                     }
                     Ok(text_response(StatusCode::BAD_GATEWAY, "bad gateway"))
                 }
@@ -119,7 +193,7 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>
         .unwrap()
 }
 
-async fn check_backend_health(client: HttpClient, backend_address: String) -> bool {
+async fn check_backend_health(client: HttpClient, backend_address: &str) -> bool {
     let req = Request::builder()
         .method("GET")
         .uri(backend_address)
@@ -137,86 +211,133 @@ pub async fn serve(
     load_balancer: Arc<Mutex<LoadBalancer>>,
     client: HttpClient,
     upstream_timeout_ms: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    shutdown_token: CancellationToken,
+) -> Result<(), AppError> {
+    let mut tasks = JoinSet::new();
+
     loop {
         let client_for_connection = client.clone();
 
-        match listener.accept().await {
-            Ok((stream, _)) => {
+        tokio::select! {
+            Some(res) = tasks.join_next(), if !tasks.is_empty() => {
+                match res {
+                    Ok(()) => {}
+                    Err(join_err) => return Err(AppError::Task(join_err)),
+                }
+            }
+
+            result = listener.accept() => {
+                let (stream, _) = result.map_err(AppError::Accept)?;
+
+                if shutdown_token.is_cancelled() {
+                    break;
+                }
+
+                let proxy_token = shutdown_token.clone();
                 let io = TokioIo::new(stream);
                 let load_balancer_clone = Arc::clone(&load_balancer);
 
-                tokio::spawn(async move {
+                tasks.spawn(async move {
                     let service = service_fn(move |req| {
                         let data_clone = Arc::clone(&load_balancer_clone);
                         let client_for_request = client_for_connection.clone();
-
                         async move {
                             handle_request(req, data_clone, client_for_request, upstream_timeout_ms)
                                 .await
                         }
                     });
 
-                    if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                        eprintln!("Connection error: {err}");
+                    tokio::select! {
+                        res = http1::Builder::new().serve_connection(io, service) => {
+                            if let Err(err) = res {
+                                error!(error = %err, "Upstream connection error");
+                            }
+                        }
+                        _ = proxy_token.cancelled() => {
+                        }
                     }
                 });
             }
-            Err(e) => {
-                eprintln!("Failed to accept connection: {e}");
+
+            _ = shutdown_token.cancelled() => {
+                break;
             }
         }
     }
+
+    while let Some(res) = tasks.join_next().await {
+        match res {
+            // Успешное завершение таски -> переходим к следующей
+            Ok(()) => continue,
+
+            // Ошибка (паника или отмена) -> прерываемся и возвращаем AppError
+            Err(join_err) => return Err(AppError::Task(join_err)),
+        }
+    }
+
+    Ok(())
 }
 
-pub async fn run(
-    address: &str,
-    load_balancer: LoadBalancer,
-    upstream_timeout_ms: u64,
-    health_check_interval_ms: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind(address).await?;
-
-    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
-    let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
-
-    start_health_checker(
-        Arc::clone(&shared_load_balancer),
-        client.clone(),
-        Duration::from_millis(health_check_interval_ms),
-    );
-
-    serve(listener, shared_load_balancer, client, upstream_timeout_ms).await
-}
-
-pub fn start_health_checker(
-    load_balancer: Arc<std::sync::Mutex<LoadBalancer>>,
+pub async fn start_health_checker(
+    load_balancer: Arc<Mutex<LoadBalancer>>,
     client: HttpClient,
     interval: Duration,
-) {
-    tokio::spawn(async move {
-        loop {
-            sleep(interval).await;
+    cancellation: CancellationToken,
+) -> Result<(), AppError> {
+    let mut tasks = JoinSet::new();
 
-            let backends_snapshot = {
-                match load_balancer.lock() {
-                    Ok(guard) => guard.unhealthy_backends_snapshot(),
-                    Err(_) => continue,
+    loop {
+        tokio::select! {
+            Some(res) = tasks.join_next(), if !tasks.is_empty() => {
+                match res {
+                    Ok(()) => {}
+                    Err(join_err) => return Err(AppError::Task(join_err)),
                 }
-            };
+            }
 
-            for backend in backends_snapshot {
-                let client_clone = client.clone();
-                let lb_clone = Arc::clone(&load_balancer);
-
-                tokio::spawn(async move {
-                    let is_healthy = check_backend_health(client_clone, backend.address).await;
-
-                    if let Ok(mut guard) = lb_clone.lock() {
-                        guard.set_backend_healthy(backend.index, is_healthy);
+            _ = cancellation.cancelled() => {
+                break;
+            }
+            _ = sleep(interval) => {
+                let backends_snapshot = {
+                    match load_balancer.lock() {
+                        Ok(guard) => guard.unhealthy_backends_snapshot(),
+                        Err(_) => continue,
                     }
-                });
+                };
+                for backend in backends_snapshot {
+                    let cancellation_clone = cancellation.clone();
+                    let client_clone = client.clone();
+                    let lb_clone = Arc::clone(&load_balancer);
+                    tasks.spawn(async move {
+                        let result = tokio::select! {
+                            _ = cancellation_clone.cancelled() => {
+                                return;
+                            }
+
+                            result = check_backend_health(client_clone, &backend.address) => {
+                                result
+                            }
+                        };
+
+                        if let Ok(mut guard) = lb_clone.lock() {
+                            guard.set_backend_healthy(backend.index, result);
+                        }
+                    });
+                }
             }
         }
-    });
+    }
+
+    while let Some(res) = tasks.join_next().await {
+        match res {
+            // Успешное завершение таски -> переходим к следующей
+            Ok(()) => continue,
+
+            // Ошибка (паника или отмена) -> прерываемся и возвращаем AppError
+            Err(join_err) => return Err(AppError::Task(join_err)),
+        }
+    }
+
+    Ok(())
 }

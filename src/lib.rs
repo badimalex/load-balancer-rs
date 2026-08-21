@@ -2,10 +2,15 @@ pub mod backend;
 pub mod http_server;
 
 mod backend_pool;
+mod config;
+mod errors;
 mod load_balancer;
 
 pub use backend::Backend;
 pub use backend_pool::BackendPool;
+pub use config::Config;
+pub use config::ConfigError;
+pub use errors::AppError;
 pub use load_balancer::LoadBalancer;
 
 #[cfg(test)]

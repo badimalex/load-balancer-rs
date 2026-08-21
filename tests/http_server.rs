@@ -14,6 +14,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio_util::sync::CancellationToken;
 
 use std::time::Duration;
 use tokio::time::sleep;
@@ -28,17 +29,25 @@ async fn spawn_proxy(
     let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
 
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
-
-    start_health_checker(
-        Arc::clone(&shared_load_balancer),
-        client.clone(),
-        Duration::from_millis(100),
-    );
+    let shutdown_token = CancellationToken::new();
 
     let handle = tokio::spawn(async move {
-        serve(listener, shared_load_balancer, client, UPSTREAM_TIMEOUT_RAW)
-            .await
-            .unwrap();
+        tokio::try_join!(
+            start_health_checker(
+                shared_load_balancer.clone(),
+                client.clone(),
+                Duration::from_millis(100),
+                shutdown_token.clone(),
+            ),
+            serve(
+                listener,
+                shared_load_balancer,
+                client,
+                UPSTREAM_TIMEOUT_RAW,
+                shutdown_token,
+            ),
+        )
+        .unwrap();
     });
 
     (addr, handle)
@@ -52,12 +61,14 @@ async fn test_empty_pool_returns_503() {
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
 
     let shared_load_balancer = Arc::new(Mutex::new(LoadBalancer::new(pool)));
+    let shutdown_token = CancellationToken::new();
 
     let server_handle = tokio::spawn(serve(
         listener,
         shared_load_balancer,
         client.clone(),
         UPSTREAM_TIMEOUT_RAW,
+        shutdown_token.clone(),
     ));
     let req = Request::builder()
         .uri(format!("http://{}/any", addr))
@@ -125,12 +136,14 @@ async fn test_health_does_not_advance_round_robin() {
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
 
     let shared_load_balancer = Arc::new(Mutex::new(LoadBalancer::new(pool)));
+    let shutdown_token = CancellationToken::new();
 
     let server_handle = tokio::spawn(serve(
         listener,
         shared_load_balancer,
         client.clone(),
         UPSTREAM_TIMEOUT_RAW,
+        shutdown_token,
     ));
 
     // Запрос /health не должен сдвигать балансировку
@@ -178,12 +191,14 @@ async fn http_routing_skips_unhealthy_backend() {
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
 
     let shared_load_balancer = Arc::new(Mutex::new(load_balancer));
+    let shutdown_token = CancellationToken::new();
 
     let server_handle = tokio::spawn(serve(
         listener,
         shared_load_balancer,
         client.clone(),
         UPSTREAM_TIMEOUT_RAW,
+        shutdown_token,
     ));
 
     let req1 = Request::builder()
@@ -1027,4 +1042,117 @@ async fn fast_request_is_not_blocked_by_slow_request() {
     assert_eq!(&body1[..], b"backend-a");
 
     handle.abort();
+}
+
+#[tokio::test]
+async fn test_health_checker_cancellation() {
+    let pool = BackendPool::new();
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let shared_load_balancer = Arc::new(Mutex::new(LoadBalancer::new(pool)));
+    let cancellation = CancellationToken::new();
+    let token_clone = cancellation.clone();
+    let interval = Duration::from_secs(1);
+
+    let handle = start_health_checker(shared_load_balancer, client, interval, cancellation);
+
+    // 4. Отменяем токен через небольшой промежуток времени или сразу
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    token_clone.cancel();
+
+    // Оборачиваем ожидание в timeout, чтобы тест упал, если отмена не сработала
+    let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+
+    assert!(
+        result.is_ok(),
+        "Фоновая задача не завершилась по сигналу отмены вовремя!"
+    );
+}
+
+#[tokio::test]
+async fn test_serve_cancellation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let pool = BackendPool::new();
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let shared_load_balancer = Arc::new(Mutex::new(LoadBalancer::new(pool)));
+    let shutdown_token = CancellationToken::new();
+    let token_clone = shutdown_token.clone();
+
+    let handle = tokio::spawn(serve(
+        listener,
+        shared_load_balancer,
+        client.clone(),
+        UPSTREAM_TIMEOUT_RAW,
+        shutdown_token,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    token_clone.cancel();
+
+    // Оборачиваем ожидание в timeout, чтобы тест упал, если отмена не сработала
+    let timeout_result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+    let join_result =
+        timeout_result.expect("Фоновая задача не завершилась по сигналу отмены вовремя!");
+
+    // 2. Проверяем, что задача не упала с panic
+    let serve_result = join_result.expect("Серверная задача завершилась паникой!");
+
+    assert!(
+        serve_result.is_ok(),
+        "Функция serve завершилась с ошибкой: {:?}",
+        serve_result.unwrap_err()
+    );
+}
+
+#[tokio::test]
+async fn shutdown_stops_server_and_health_checker() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let addr = listener.local_addr().unwrap();
+    let mut pool = BackendPool::new();
+    let backend_a = spawn_backend("backend-a").await;
+    pool.add(Backend::new(format!("http://{backend_a}")));
+
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let shared_load_balancer = Arc::new(Mutex::new(LoadBalancer::new(pool)));
+
+    let shutdown_token = CancellationToken::new();
+    let token_clone1 = shutdown_token.clone();
+    let token_clone2 = shutdown_token.clone();
+
+    let handle_serve = tokio::spawn(serve(
+        listener,
+        shared_load_balancer.clone(),
+        client.clone(),
+        UPSTREAM_TIMEOUT_RAW,
+        token_clone1,
+    ));
+
+    let interval = Duration::from_millis(10);
+    let handle_health =
+        start_health_checker(shared_load_balancer, client.clone(), interval, token_clone2);
+
+    let req1 = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", addr))
+        .header("Host", addr.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res1 = client.request(req1).await.unwrap();
+
+    assert_eq!(res1.status(), StatusCode::OK);
+
+    shutdown_token.cancel();
+
+    let res_serve = tokio::time::timeout(Duration::from_millis(200), handle_serve).await;
+    let serve_output = res_serve.expect("Фоновая задача сервера не завершилась вовремя!");
+    let serve_res = serve_output.expect("Задача сервера упала в панику (panic)!");
+    assert!(serve_res.is_ok(), "Функция serve() вернула ошибку!");
+
+    let health_output = tokio::time::timeout(Duration::from_millis(200), handle_health)
+        .await
+        .expect("health checker не завершился после cancellation");
+
+    health_output.expect("health checker task завершилась panic");
 }

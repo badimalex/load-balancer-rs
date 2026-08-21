@@ -1,4 +1,5 @@
 use crate::BackendPool;
+use tracing::info;
 
 #[derive(Default, Debug)]
 pub struct LoadBalancer {
@@ -23,6 +24,9 @@ impl LoadBalancer {
     pub fn set_backend_healthy(&mut self, index: usize, healthy: bool) {
         if let Some(current_backend) = self.backend_pool.get_mut(index) {
             current_backend.set_healthy(healthy);
+            if healthy {
+                info!(backend_url = current_backend.address(), "Backend recovered");
+            }
         }
     }
 

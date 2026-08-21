@@ -162,6 +162,7 @@ The integration suite covers:
 For performance measurements, build and run the proxy in release mode:
 
 ```bash
+LB_LISTEN_ADDR=127.0.0.1:8080 LB_BACKENDS=127.0.0.1:8081,127.0.0.1:8082 LB_UPSTREAM_TIMEOUT_MS=1000 LB_HEALTH_CHECK_INTERVAL_MS=5000 cargo run     
 cargo run --release
 ```
 
